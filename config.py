@@ -21,3 +21,7 @@ LOG = -1003133889122
 # ADMINS list
 ADMINS = [8228219942]
 ADMINS.append(OWNER)
+
+
+# Default credit used in captions when /uc config uses df
+CREDIT = "Mrs.UC"
