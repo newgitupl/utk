@@ -123,7 +123,7 @@ def remove_thumbnail(userid: int, thumb_type: str):
 def get_watermark_settings(userid: int):
     user = users.find_one({"userid": userid})
     default_settings = {
-        "text": "MARCO",
+        "text": "Mrs.Uc",
         "color": "white",
         "font": "DejaVuSans-Bold.ttf",
         "opacity": 0.8,
