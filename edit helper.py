@@ -1,0 +1,683 @@
+import os
+import logging   
+import subprocess   
+import datetime   
+import asyncio   
+import os
+import mmap
+import requests   
+import time
+import base64
+from io import BytesIO
+from p_bar import progress_bar
+from PyPDF2 import PdfReader, PdfWriter
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+import aiohttp   
+import aiofiles   
+import tgcrypto   
+import concurrent.futures   
+import subprocess   
+from pyrogram.types import Message   
+from pyrogram import Client, filters
+from pathlib import Path
+import re
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
+from base64 import b64decode
+
+import shutil
+from tqdm import tqdm
+from io import BytesIO
+from math import ceil
+
+from mpdparser import MPDParser
+
+# For PW DRM API responses (if needed)
+def get_pw_mpd_and_keys(api_url):
+    response = requests.get(api_url)
+    response_json = response.json()
+    mpd = response_json.get('mpd_url')
+    
+    # Handle keys properly - the API returns an array of keys
+    keys_array = response_json.get('keys', [])
+    
+    # If we have keys in the array, use the first one
+    if keys_array and isinstance(keys_array, list) and len(keys_array) > 0:
+        keys = keys_array[0]  # Use the first key in the array
+    else:
+        keys = ""
+    
+    print(f"MPD URL: {mpd}")
+    print(f"Keys: {keys}")
+    
+    return mpd, keys
+
+import aiohttp
+import aiofiles
+from pathlib import Path
+
+async def async_download_file(session, url, path):
+    try:
+        async with session.get(url) as response:
+            response.raise_for_status()
+            async with aiofiles.open(path, mode='wb') as f:
+                async for chunk in response.content.iter_chunked(8192):
+                    await f.write(chunk)
+    except Exception as e:
+        print(f"⚠️ Failed to download {url}: {e}")
+
+async def batch_download_segments(segment_dict, download_dir):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        for num, url in segment_dict.items():
+            file_path = download_dir / f"{num:03d}.m4s"
+            tasks.append(async_download_file(session, url, file_path))
+        await asyncio.gather(*tasks)
+
+async def decrypt_and_merge_pw_drm_video(mpd_url, keys_string, output_path, output_name, quality="720"):
+    try:
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        print(f"📥 Parsing MPD and downloading segments...")
+        print(f"MPD URL: {mpd_url}")
+        print(f"Keys: {keys_string}")
+        parser = MPDParser(mpd_url).pre_process().parse()
+        segments = parser.get_segment_urls()
+
+        video_init = segments['video']['init']
+        audio_init = segments['audio']['init']
+        video_segs = segments['video']['segments']
+        audio_segs = segments['audio']['segments']
+
+        video_dir = output_path / "video_segments"
+        audio_dir = output_path / "audio_segments"
+        video_dir.mkdir(exist_ok=True)
+        audio_dir.mkdir(exist_ok=True)
+
+        # Download init
+        async with aiohttp.ClientSession() as session:
+            await asyncio.gather(
+                async_download_file(session, video_init, video_dir / "init.mp4"),
+                async_download_file(session, audio_init, audio_dir / "init.mp4")
+            )
+
+
+        # Download segments
+        print("🎞️ Downloading video segments asynchronously...")
+        await batch_download_segments(video_segs, video_dir)
+
+
+        print("🔊 Downloading audio segments asynchronously...")
+        await batch_download_segments(audio_segs, audio_dir)
+
+
+        # Concatenate into raw MP4s
+        with open(output_path / "video_encrypted.mp4", "wb") as vout:
+            for part in ["init.mp4"] + [f"{i:03d}.m4s" for i in video_segs.keys()]:
+                with open(video_dir / part, "rb") as f:
+                    shutil.copyfileobj(f, vout)
+
+        with open(output_path / "audio_encrypted.m4a", "wb") as aout:
+            for part in ["init.mp4"] + [f"{i:03d}.m4s" for i in audio_segs.keys()]:
+                with open(audio_dir / part, "rb") as f:
+                    shutil.copyfileobj(f, aout)
+
+
+
+        # Parse video_kid and video_key from keys_string
+        if ":" in keys_string:
+            video_kid, video_key = keys_string.split(":", 1)
+        else:
+            # Try to handle other formats or log more details
+            print(f"Keys string received: '{keys_string}'")
+            raise Exception(f"PW DRM key string must be in 'key_id:key' format. Received: {keys_string}")
+
+        cmd_video = (
+            f'packager input="{output_path}/video_encrypted.mp4",stream=video,output="{output_path}/video.mp4" '
+            f'--enable_raw_key_decryption '
+            f'--keys key_id={video_kid}:key={video_key}'
+        )
+        print(f"🔐 Running Shaka Packager video decryption...\n[DEBUG] {cmd_video}")
+        os.system(cmd_video)
+
+        cmd_audio = (
+            f'packager input="{output_path}/audio_encrypted.m4a",stream=audio,output="{output_path}/audio.m4a" '
+            f'--enable_raw_key_decryption '
+            f'--keys key_id={video_kid}:key={video_key}'
+        )
+        print(f"🔐 Running Shaka Packager audio decryption...\n[DEBUG] {cmd_audio}")
+        os.system(cmd_audio)
+
+        # Merge with FFmpeg
+        cmd_merge = f'ffmpeg -i "{output_path}/video.mp4" -i "{output_path}/audio.m4a" -c copy "{output_path}/{output_name}.mp4"'
+        print("📦 Merging final output...")
+        print(f"[DEBUG] FFmpeg command: {cmd_merge}")
+        
+        # Execute the FFmpeg command
+        os.system(cmd_merge)
+        
+        # Clean up temp files
+        for file in output_path.glob("*encrypted*"):
+            file.unlink()
+        shutil.rmtree(video_dir, ignore_errors=True)
+        shutil.rmtree(audio_dir, ignore_errors=True)
+        
+        # Remove intermediate video and audio files
+        video_file = output_path / "video.mp4"
+        audio_file = output_path / "audio.m4a"
+        
+        if video_file.exists():
+            video_file.unlink()
+            print(f"✅ Removed intermediate video file: {video_file}")
+            
+        if audio_file.exists():
+            audio_file.unlink()
+            print(f"✅ Removed intermediate audio file: {audio_file}")
+
+        final_path = output_path / f"{output_name}.mp4"
+        if not final_path.exists():
+            raise FileNotFoundError("Final video not created.")
+
+        return str(final_path)
+
+    except Exception as e:
+        print(f"❌ Error in PW DRM processing: {e}")
+        raise
+
+
+
+def duration(filename):
+    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration", "-of",
+                             "default=noprint_wrappers=1:nokey=1", filename],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    return float(result.stdout)
+
+def get_mps_and_keys(api_url):
+    response = requests.get(api_url)
+    response_json = response.json()
+    mpd = response_json.get('MPD')
+    keys = response_json.get('KEYS')
+    return mpd, keys
+
+       
+async def run(cmd):   
+    proc = await asyncio.create_subprocess_shell(   
+        cmd,   
+        stdout=asyncio.subprocess.PIPE,   
+        stderr=asyncio.subprocess.PIPE)   
+   
+    stdout, stderr = await proc.communicate()   
+   
+    print(f'[{cmd!r} exited with {proc.returncode}]')   
+    if proc.returncode == 1:   
+        return False   
+    if stdout:   
+        return f'[stdout]\n{stdout.decode()}'   
+    if stderr:   
+        return f'[stderr]\n{stderr.decode()}'   
+   
+    
+def decrypt_file(file_path, key):  
+    if not os.path.exists(file_path): 
+        return False  
+
+    with open(file_path, "r+b") as f:  
+        num_bytes = min(28, os.path.getsize(file_path))  
+        with mmap.mmap(f.fileno(), length=num_bytes, access=mmap.ACCESS_WRITE) as mmapped_file:  
+            for i in range(num_bytes):  
+                mmapped_file[i] ^= ord(key[i]) if i < len(key) else i 
+    return True
+
+
+async def download_and_decrypt_video(url, cmd, name, key):  
+    video_path = await download_video(url, cmd, name)  
+    
+    if video_path:  
+        decrypted = decrypt_file(video_path, key)  
+        if decrypted:  
+            print(f"File {video_path} decrypted successfully.")  
+            return video_path  
+        else:  
+            print(f"Failed to decrypt {video_path}.")  
+            return None  
+
+async def download_and_decrypt_pdf(url, name, key):  
+    download_cmd = f'yt-dlp -o "{name}.pdf" "{url}" -R 25 --fragment-retries 25'  
+    try:  
+        subprocess.run(download_cmd, shell=True, check=True)  
+        print(f"Downloaded PDF: {name}.pdf")  
+    except subprocess.CalledProcessError as e:  
+        print(f"Error during download: {e}")  
+        return False  
+    
+    file_path = f"{name}.pdf"  
+    if not os.path.exists(file_path):  
+        print(f"The file {file_path} does not exist.")  
+        return False  
+
+    try:  
+        with open(file_path, "r+b") as f: 
+            num_bytes = min(28, os.path.getsize(file_path))  
+            with mmap.mmap(f.fileno(), length=num_bytes, access=mmap.ACCESS_WRITE) as mmapped_file:  
+                for i in range(num_bytes):  
+                    mmapped_file[i] ^= ord(key[i]) if i < len(key) else i  
+
+        print(f"Decryption completed for {file_path}.") 
+        return file_path 
+    except Exception as e:  
+        print(f"Error during decryption: {e}")  
+        return False
+
+#==========================  MEGATRON HELPER   ====================================
+
+
+
+
+def duration(filename):
+    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                             "format=duration", "-of",
+                             "default=noprint_wrappers=1:nokey=1", filename],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT)
+    return float(result.stdout)
+    
+def exec(cmd):
+        process = subprocess.run(cmd, stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        output = process.stdout.decode()
+        print(output)
+        return output
+        #err = process.stdout.decode()
+def pull_run(work, cmds):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=work) as executor:
+        print("Waiting for tasks to complete")
+        fut = executor.map(exec,cmds)
+        
+async def aio(url,name):
+    k = f'{name}.pdf'
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                f = await aiofiles.open(k, mode='wb')
+                await f.write(await resp.read())
+                await f.close()
+    return k
+
+
+async def download(url,name):
+    ka = f'{name}.pdf'
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                f = await aiofiles.open(ka, mode='wb')
+                await f.write(await resp.read())
+                await f.close()
+    return ka
+
+
+
+def parse_vid_info(info):
+    info = info.strip()
+    info = info.split("\n")
+    new_info = []
+    temp = []
+    for i in info:
+        i = str(i)
+        if "[" not in i and '---' not in i:
+            while "  " in i:
+                i = i.replace("  ", " ")
+            i.strip()
+            i = i.split("|")[0].split(" ",2)
+            try:
+                if "RESOLUTION" not in i[2] and i[2] not in temp and "audio" not in i[2]:
+                    temp.append(i[2])
+                    new_info.append((i[0], i[2]))
+            except:
+                pass
+    return new_info
+
+
+def vid_info(info):
+    info = info.strip()
+    info = info.split("\n")
+    new_info = dict()
+    temp = []
+    for i in info:
+        i = str(i)
+        if "[" not in i and '---' not in i:
+            while "  " in i:
+                i = i.replace("  ", " ")
+            i.strip()
+            i = i.split("|")[0].split(" ",3)
+            try:
+                if "RESOLUTION" not in i[2] and i[2] not in temp and "audio" not in i[2]:
+                    temp.append(i[2])
+                    
+                    # temp.update(f'{i[2]}')
+                    # new_info.append((i[2], i[0]))
+                    #  mp4,mkv etc ==== f"({i[1]})" 
+                    
+                    new_info.update({f'{i[2]}':f'{i[0]}'})
+
+            except:
+                pass
+    return new_info
+
+async def decrypt_and_merge_video(mpd_url, keys_string, output_path, output_name, quality="720"):
+    try:
+        output_path = Path(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        cmd1 = f'yt-dlp -f "bv[height<={quality}]+ba/b" -o "{output_path}/file.%(ext)s" --allow-unplayable-format --no-check-certificate --external-downloader aria2c "{mpd_url}"'
+        print(f"Running command: {cmd1}")
+        os.system(cmd1)
+        
+        avDir = list(output_path.iterdir())
+        print(f"Downloaded files: {avDir}")
+        print("Decrypting")
+
+        video_decrypted = False
+        audio_decrypted = False
+
+        for data in avDir:
+            if data.suffix == ".mp4" and not video_decrypted:
+                cmd2 = f'mp4decrypt {keys_string} --show-progress "{data}" "{output_path}/video.mp4"'
+                print(f"Running command: {cmd2}")
+                os.system(cmd2)
+                if (output_path / "video.mp4").exists():
+                    video_decrypted = True
+                data.unlink()
+            elif data.suffix == ".m4a" and not audio_decrypted:
+                cmd3 = f'mp4decrypt {keys_string} --show-progress "{data}" "{output_path}/audio.m4a"'
+                print(f"Running command: {cmd3}")
+                os.system(cmd3)
+                if (output_path / "audio.m4a").exists():
+                    audio_decrypted = True
+                data.unlink()
+
+        if not video_decrypted or not audio_decrypted:
+            raise FileNotFoundError("Decryption failed: video or audio file not found.")
+
+        cmd4 = f'ffmpeg -i "{output_path}/video.mp4" -i "{output_path}/audio.m4a" -c copy "{output_path}/{output_name}.mp4"'
+        print(f"Running command: {cmd4}")
+        os.system(cmd4)
+        if (output_path / "video.mp4").exists():
+            (output_path / "video.mp4").unlink()
+        if (output_path / "audio.m4a").exists():
+            (output_path / "audio.m4a").unlink()
+        
+        filename = output_path / f"{output_name}.mp4"
+
+        if not filename.exists():
+            raise FileNotFoundError("Merged video file not found.")
+
+        cmd5 = f'ffmpeg -i "{filename}" 2>&1 | grep "Duration"'
+        duration_info = os.popen(cmd5).read()
+        print(f"Duration info: {duration_info}")
+
+        return str(filename)
+
+    except Exception as e:
+        print(f"Error during decryption and merging: {str(e)}")
+        raise
+        
+
+async def run(cmd):
+    proc = await asyncio.create_subprocess_shell(
+        cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+
+    stdout, stderr = await proc.communicate()
+
+    print(f'[{cmd!r} exited with {proc.returncode}]')
+    if proc.returncode == 1:
+        return False
+    if stdout:
+        return f'[stdout]\n{stdout.decode()}'
+    if stderr:
+        return f'[stderr]\n{stderr.decode()}'
+
+    
+
+def old_download(url, file_name, chunk_size = 1024 * 10):
+    if os.path.exists(file_name):
+        os.remove(file_name)
+    r = requests.get(url, allow_redirects=True, stream=True)
+    with open(file_name, 'wb') as fd:
+        for chunk in r.iter_content(chunk_size=chunk_size):
+            if chunk:
+                fd.write(chunk)
+    return file_name
+
+
+def human_readable_size(size, decimal_places=2):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB', 'PB']:
+        if size < 1024.0 or unit == 'PB':
+            break
+        size /= 1024.0
+    return f"{size:.{decimal_places}f} {unit}"
+
+
+def time_name():
+    date = datetime.date.today()
+    now = datetime.datetime.now()
+    current_time = now.strftime("%H%M%S")
+    return f"{date} {current_time}.mp4"
+
+# helper.py
+async def download_and_send_video(url, name, chat_id, bot, log_channel_id, accept_logs, caption, m):
+    """
+    Downloads a video from a URL and sends it to the specified chat.
+    Handles encrypted video URLs differently if needed.
+    """
+    try:
+        # Check if the URL is for an encrypted video
+        if "encrypted" in url:
+            # Add specific handling for encrypted videos here if necessary
+            print("Handling encrypted video...")
+        
+        # Download the video
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    video_data = await response.read()
+                    video_path = f"{name}.mp4"
+                    
+                    # Save video to a file
+                    with open(video_path, 'wb') as f:
+                        f.write(video_data)
+                    
+                    # Send the video to the user
+                    message = await bot.send_video(chat_id=chat_id, video=video_path, caption=caption)
+                    
+                    # Log the video to a specific channel if required
+                    if accept_logs == 1:
+                        file_id = message.video.file_id
+                        await bot.send_video(chat_id=log_channel_id, video=file_id, caption=caption)
+                    
+                    # Cleanup: Remove the video file after sending
+                    os.remove(video_path)
+                else:
+                    await m.reply_text(f"Failed to download video. Status code: {response.status}")
+    except Exception as e:
+        await m.reply_text(f"An error occurred: {str(e)}")
+
+
+
+async def download_video(url,cmd, name):
+    download_cmd = f'{cmd} -R 25 --fragment-retries 25 --external-downloader aria2c --downloader-args "aria2c: -x 16 -j 32" --cookies cookies.txt'
+    global failed_counter  
+    print(download_cmd)
+    logging.info(download_cmd)
+    k = subprocess.run(download_cmd, shell=True)
+    if "visionias" in cmd and k.returncode != 0 and failed_counter <= 10:
+        failed_counter += 1
+        await asyncio.sleep(5)
+        await download_video(url, cmd, name)
+    failed_counter = 0
+    try:
+        if os.path.isfile(name):
+            return name
+        elif os.path.isfile(f"{name}.webm"):
+            return f"{name}.webm"
+        name = name.split(".")[0]
+        if os.path.isfile(f"{name}.mkv"):
+            return f"{name}.mkv"
+        elif os.path.isfile(f"{name}.mp4"):
+            return f"{name}.mp4"
+        elif os.path.isfile(f"{name}.mp4.webm"):
+            return f"{name}.mp4.webm"
+
+        return name
+    except FileNotFoundError as exc:
+        return os.path.isfile.splitext[0] + "." + "mp4"
+
+
+import requests
+
+async def send_doc(bot: Client, m: Message, ka, caption, prog, count, name, channel_id, thumb="pdfthumb.jpg"):
+    reply = await bot.send_message(channel_id, f"Downloading pdf:\n<pre><code>{name}</code></pre>")
+    time.sleep(1)
+    start_time = time.time()
+    await bot.send_document(
+        ka,
+        thumb=thumb,
+        caption=caption
+         # <<-- thumbnail image path (local file) or bytes IO
+    )
+    count += 1
+    await reply.delete(True)
+    time.sleep(1)
+    os.remove(ka)
+    time.sleep(3)
+
+
+#======================  WATERMARK =============================
+
+
+from marco.authdb import get_watermark_settings
+
+async def send_vid(bot: Client, m: Message, caption, filename, thumb, name, prog, channel_id):
+    # Get user's watermark settings
+    user_settings = get_watermark_settings(m.from_user.id)
+    
+    await prog.delete(True)
+    reply = await bot.send_message(channel_id, f"** 🔍 Video Uploading** : \n<blockquote expandable> {name}</blockquote>")
+
+    try:
+        if thumb == "/d" or not thumb:
+            # Generate thumbnail with watermark based on settings
+            try:
+                # Check if watermark is enabled
+                if not user_settings.get('enabled', True):
+                    # Just create thumbnail without watermark
+                    subprocess.run(
+                        f'ffmpeg -i "{filename}" -ss 00:00:01 -vframes 1 -s 1280x720 "{filename}.jpg"',
+                        shell=True
+                    )
+                    thumbnail = f"{filename}.jpg"
+                else:
+                    # Get watermark configuration
+                    watermark_text = user_settings.get('text', 'AAWARA ')
+                    font_name = user_settings.get('font', 'Chopsic.otf')
+                    text_color = user_settings.get('color', 'white').lower()
+                    opacity = user_settings.get('opacity', 0.8)
+                    font_size = user_settings.get('font_size', 200)
+
+                    # Color codes mapping
+                    color_codes = {
+                        'white': '#FFFFFF',
+                        'black': '#000000',
+                        'red': '#FF0000',
+                        'blue': '#0000FF',
+                        'green': '#00FF00',
+                        'golden': '#FFD700'
+                    }
+                    
+                    # Get hex color code
+                    font_color = color_codes.get(text_color, text_color)
+                    
+                    # Get font path
+                    font_path = os.path.join("fonts", font_name)
+                    if not os.path.exists(font_path):
+                        # Fallback to default font
+                        font_path = os.path.join("fonts", "Chopsic.otf")
+
+                    # Create temp thumbnail
+                    subprocess.run(
+                        f'ffmpeg -i "{filename}" -ss 00:00:01 -vframes 1 -s 1280x720 "{filename}_temp.jpg"',
+                        shell=True
+                    )
+
+                    # Apply watermark with user settings
+                    subprocess.run(
+                        f'ffmpeg -i "{filename}_temp.jpg" -vf "drawtext=text=\'{watermark_text}\':'
+                        f'fontfile=\'{font_path}\':'
+                        f'fontsize={font_size}:'
+                        f'fontcolor={font_color}@{opacity}:'
+                        f'x=(w-text_w)/2:y=(h-text_h)/2" '
+                        f'"{filename}.jpg"',
+                        shell=True
+                    )
+
+                    # Clean up temp file
+                    if os.path.exists(f"{filename}_temp.jpg"):
+                        os.remove(f"{filename}_temp.jpg")
+                    
+                    thumbnail = f"{filename}.jpg"
+
+            except Exception as e:
+                print(f"Error applying watermark: {str(e)}")
+                # Fallback to thumbnail without watermark
+                subprocess.run(
+                    f'ffmpeg -i "{filename}" -ss 00:00:01 -vframes 1 -s 1280x720 "{filename}.jpg"',
+                    shell=True
+                )
+                thumbnail = f"{filename}.jpg"
+        else:
+            thumbnail = thumb
+            
+    except Exception as e:
+        await m.reply_text(str(e))
+        # Fallback to simple thumbnail
+        subprocess.run(
+            f'ffmpeg -i "{filename}" -ss 00:00:01 -vframes 1 -s 1280x720 "{filename}.jpg"',
+            shell=True
+        )
+        thumbnail = f"{filename}.jpg"
+
+    dur = int(duration(filename))
+    start_time = time.time()
+
+    try:
+        await bot.send_video(
+            channel_id,
+            filename,
+            caption=caption,
+            supports_streaming=True,
+            height=720,
+            width=1280,
+            thumb=thumbnail,
+            duration=dur,
+            progress=progress_bar,
+            progress_args=(reply, start_time)
+            
+        )
+    except Exception as e:
+        await bot.send_document(
+            channel_id,
+            filename,
+            caption=caption,
+            thumb=thumbnail,
+            progress=progress_bar,
+            progress_args=(reply, start_time)
+        )
+
+    # Cleanup
+    if os.path.exists(f"{filename}.jpg"):
+        os.remove(f"{filename}.jpg")
+    await reply.delete(True)
