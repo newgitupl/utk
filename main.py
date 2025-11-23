@@ -1883,6 +1883,8 @@ async def txt_handler(bot: Client, m: Message):
 async def text_handler(bot: Client, m: Message):
     if m.from_user.is_bot:
         return
+    if not m.text or m.text.startswith("/"):
+        return
     links = m.text
     path = None
     match = re.search(r'https?://\S+', links)
