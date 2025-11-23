@@ -1,3 +1,4 @@
+
 from pymongo import MongoClient
 import os
 from datetime import datetime
@@ -182,3 +183,94 @@ def update_auto_topic_settings(userid: int, new_settings: dict):
     )
     return current
 
+# ---------------- UC Command Auth Helper ----------------
+async def uc_command(client: Client, message: Message) -> bool:
+    """Handle /uc auth with admin+DB checks.
+
+    Rules:
+    - PRIVATE: user must be authorized
+    - GROUP / SUPERGROUP / FORUM / CHANNEL:
+        ✅ Allowed if:
+          (A) chat is authorized in DB (is_channel_authorized)
+              OR
+          (B) any human admin of that chat is an authorized user
+    """
+    try:
+        user = message.from_user
+        user_id = user.id if user else None
+
+        bot = await client.get_me()
+        bot_username = bot.username
+
+        chat = message.chat
+        chat_type = chat.type
+        chat_id = chat.id
+
+        print(f"📥 /uc received - user={user_id}, chat={chat_id}, type={chat_type}")
+
+        chat_type_str = str(chat_type).lower()
+
+        # 1️⃣ PRIVATE: simple user auth
+        if "private" in chat_type_str:
+            if user_id and db.is_user_authorized(user_id, bot_username):
+                return True
+            else:
+                await message.reply_text("❌ You are not authorized. Contact admin to get access.")
+                return False
+
+        # 2️⃣ GROUP / SUPERGROUP / FORUM / CHANNEL: shared logic
+        if any(t in chat_type_str for t in ("group", "forum", "channel")):
+            # (A) DB-level chat auth (optional)
+            try:
+                if hasattr(db, "is_channel_authorized") and db.is_channel_authorized(chat_id, bot_username):
+                    print(f"✅ Chat authorized for /uc via DB: {chat_id}")
+                    return True
+            except Exception as e:
+                print(f"Error in is_channel_authorized: {str(e)}")
+
+            # (B) Telegram admins-based auth
+            try:
+                admin_ids = []
+                async for member in client.get_chat_members(chat_id, filter=ChatMembersFilter.ADMINISTRATORS):
+                    u = getattr(member, "user", None)
+                    if u and not u.is_bot:
+                        admin_ids.append(u.id)
+
+                print(f"📢 Chat admins: {admin_ids}")
+
+                for admin_id in admin_ids:
+                    try:
+                        if db.is_user_authorized(admin_id, bot_username):
+                            print(f"✅ Authorized admin found for chat: {admin_id}")
+                            return True
+                    except Exception as e:
+                        print(f"Error checking admin {admin_id} auth: {str(e)}")
+
+                print("❌ No authorized chat or admin found for /uc")
+
+                # For channels: stay silent (can't always reply)
+                if "channel" in chat_type_str:
+                    return False
+
+                # For groups / forums: tell them
+                await message.reply_text(
+                    "❌ No authorized admin found in this chat.\n\n"
+                    "At least one admin must have an active subscription."
+                )
+                return False
+
+            except Exception as e:
+                print(f"Error fetching chat admins: {str(e)}")
+                return False
+
+        # 3️⃣ Any other chat type: unsupported
+        print(f"❌ Unsupported chat type for /uc: {chat_type}")
+        return False
+
+    except Exception as e:
+        print(f"❌ Error in uc_command: {str(e)}")
+        try:
+            await message.reply_text("❌ An error occurred. Please try again.")
+        except Exception:
+            pass
+        return False
